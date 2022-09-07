@@ -4,18 +4,21 @@ var { google } = require('googleapis');
 var OAuth2 = google.auth.OAuth2;
 var moment = require('moment');
 var service = google.youtube('v3');
+const path = require('path');
 
 const SCOPES = ['https://www.googleapis.com/auth/youtube'];
 const AUTH_DIR = './auth/'
-const TOKEN_PATH = AUTH_DIR + 'youtube-nodejs-quickstart.ign.json';
-const TIMESTAMP_PATH = './latestVideoTimestamp.txt'
+const TOKEN_PATH = path.resolve(__dirname, AUTH_DIR + 'youtube-nodejs-quickstart.ign.json');
+const TIMESTAMP_PATH = path.resolve(__dirname, './latestVideoTimestamp.txt');
+const CLIENT_PATH = path.resolve(__dirname, AUTH_DIR + 'client_secret.ign.json');
 
-fs.readFile(AUTH_DIR + 'client_secret.ign.json', function processClientSecrets(err, content) {
+fs.readFile(CLIENT_PATH, function processClientSecrets(err, content) {
     if (err) {
-        console.log('Error loading client secret file: ' + err);
+        console.error('Error loading client secret file: ' + err);
         return;
     }
     // Authorize a client with the loaded credentials, then call the YouTube API.
+    
     authorize(JSON.parse(content), updateSubscriptions);
 });
 
@@ -58,7 +61,7 @@ function getNewToken(oauth2Client, callback) {
         rl.close();
         oauth2Client.getToken(code, function (err, token) {
             if (err) {
-                console.log('Error while trying to retrieve access token', err);
+                console.error('Error while trying to retrieve access token', err);
                 return;
             }
             oauth2Client.credentials = token;
@@ -93,14 +96,19 @@ async function updateSubscriptions(auth) {
 
     // Go through all pages of subscriptions and concat with allSubs array
     while (nextPageToken || allSubs.length == 0) {
-        var paginatedSubResponse = await service.subscriptions.list({
-            auth: auth,
-            part: 'snippet',
-            mine: true,
-            maxResults: 50,
-            pageToken: nextPageToken,
-            order: 'alphabetical',
-        })
+        try {
+            var paginatedSubResponse = await service.subscriptions.list({
+                auth: auth,
+                part: 'snippet',
+                mine: true,
+                maxResults: 50,
+                pageToken: nextPageToken,
+                order: 'alphabetical',
+            })
+        }
+        catch(e){
+            console.error(e.response.data)
+        }
         nextPageToken = paginatedSubResponse.data.nextPageToken;
         allSubs = allSubs.concat(paginatedSubResponse.data.items);
     }
@@ -161,6 +169,7 @@ async function filterForCurrentDay(unfilteredUploads) {
         lastTimestamp = await fs.promises.readFile(TIMESTAMP_PATH, 'utf-8');
     }
     catch {
+		console.error('No timestamp found, defaulting to 1 day before now.');
         lastTimestamp = now.clone().subtract(1, 'days');
     }
 
@@ -202,9 +211,9 @@ async function addVideosToPlaylists(auth, videoList) {
     });
 
     // Sequentially insert videos into sub playlist
-    subVideos.reduce(async (prevPromise, nextVid) => {
+    await subVideos.reduce(async (prevPromise, nextVid) => {
         await prevPromise;
-        return service.playlistItems.insert({
+		console.log((await service.playlistItems.insert({
             auth: auth,
             part: 'snippet',
             resource:
@@ -214,11 +223,12 @@ async function addVideosToPlaylists(auth, videoList) {
                     playlistId: subPlaylist.id,
                 }
             }
-        });
+        })).status);
+        return;
     }, Promise.resolve());
 
     // Sequentially insert videos into car playlist
-    carVideos.reduce( async (prevPromise, nextVid) => {
+    await carVideos.reduce( async (prevPromise, nextVid) => {
         await prevPromise;
         return service.playlistItems.insert({
             auth: auth,
@@ -268,29 +278,39 @@ function applyChannelFilters(videoList) {
                 return (video.snippet.title.toLowerCase().includes('memes') ||
                     video.tags.includes('rap') || video.tags.includes('hip hop')) && !/20\d\d/.test(video.snippet.title);
 
-            // Only Mic'd up and Game highlights from NFL's Channel
+            // Only Mic'd up from NFL's Channel
             case ('NFL'):
-                return video.snippet.title.includes('Mic\'d Up') ||
-                    (video.snippet.title.includes('Highlights') && !video.snippet.title.includes('Season'));
+                return video.snippet.title.toLowerCase().includes('mic\'d up') /*||
+                    (video.snippet.title.includes('Highlights') && !video.snippet.title.includes('Season'))*/;
 
-            // Remove Arlo news roundups, wishlist vids, and top 10s
+            // Remove Arlo news roundups, wishlist vids, splatoon vids, and top 10s
             case ('Arlo'):
                 return !video.snippet.title.toLowerCase().includes('news roundup') &&
                     !video.snippet.title.toLowerCase().includes('predict') &&
-                    !video.snippet.title.toLowerCase().includes('wishlist');
+                    !video.snippet.title.toLowerCase().includes('wishlist') && 
+                    !video.snippet.title.toLowerCase().includes('splatoon');
 
-            // Remove WAN show from LinusTechTips
+            // Remove WAN show and PC builds/upgrades from LinusTechTips
             case ('Linus Tech Tips'):
-                return !video.snippet.title.toLowerCase().includes('wan show');
+                return !(video.snippet.title.toLowerCase().includes('wan show') ||
+                video.snippet.title.toLowerCase().includes('tech upgrade') ||
+                video.tags.includes('Tech Upgrade') || 
+                video.tags.includes('tech upgrade') ||
+                video.tags.includes('Tech Makeover') || 
+                video.tags.includes('tech makeover'));
+            
+            case ('ShortCircuit'):
+                return !(video.snippet.title.toLowerCase().includes('monitor'));
 
             // Only Hot Ones from First We Feast
             case ('First We Feast'):
-                return video.snippet.title.includes('Hot Ones');
+                return video.snippet.title.toLowerCase().includes('hot ones');
 
-            // Only Smash and Nintendo Reactions from Max Dood
+            // Only Smash and Nintendo Reactions from Max Dood, plus street fighter 6
             case ('Maximilian Dood'):
-                return video.snippet.title.toLowerCase().includes('super smash bros') ||
-                    video.snippet.title.includes('Nintendo');
+                return video.snippet.title.toLowerCase().includes('max reacts') ||
+                    video.snippet.title.toLowerCase().includes('nintendo') ||
+                    video.tags.includes('street fighter 6');
 
             // Only SM64 vids from Simply
             case ('Simply'):
@@ -305,21 +325,39 @@ function applyChannelFilters(videoList) {
             case ('DotaCinema'):
                 return video.snippet.title.toLowerCase().includes('fails of the week');
 
-
             // Only Press Conferences and Mic'd up from Steelers
             case ('Pittsburgh Steelers'):
                 return video.snippet.title.toLowerCase().includes('conference');
-
 
             // Only Mason, Arteezy, Sumail from DotaShaman
             case ('Dota Shaman'):
                 return video.snippet.title.toLowerCase().startsWith('arteezy') ||
                     video.snippet.title.toLowerCase().startsWith('mason');
 
-            // Only David Pakman videos 10 minutes or less
+            // Only David Pakman videos 10 minutes or less, no caller videos
             case ('David Pakman Show'):
-                return video.duration < 11;
+                return video.duration < 11 && !(video.snippet.toLowerCase.includes('caller'));
+			
+			// No Sonic videos from Werster
+			case ('Werster'):
+				return !video.snippet.title.toLowerCase().includes('sonic');
+            
+            case ('Brett Kollman'):
+                return !(video.snippet.title.toLowerCase().includes('nfl draft'));
 
+            case ('Kurzgesagt – In a Nutshell'):
+                return !(video.snippet.title.toLowerCase().includes('virus') ||
+                        video.snippet.title.toLowerCase().includes('body') ||
+                        video.snippet.title.toLowerCase().includes('space'));
+            
+            case ('Dorkly'):
+                return !(video.snippet.title.toLowerCase().includes('compilation'));
+
+            case ('GeoWizard'):
+                return video.tags.includes('geoguessr') && !video.snippet.title.toLowerCase().includes('play along');
+
+            case ('ProJared'):
+                return !video.snippet.title.toLowerCase().includes('now in the 90s');
             // All else are good
             default:
                 return true;
