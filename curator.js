@@ -18,7 +18,7 @@ fs.readFile(CLIENT_PATH, function processClientSecrets(err, content) {
         return;
     }
     // Authorize a client with the loaded credentials, then call the YouTube API.
-    
+
     authorize(JSON.parse(content), updateSubscriptions);
 });
 
@@ -106,7 +106,7 @@ async function updateSubscriptions(auth) {
                 order: 'alphabetical',
             })
         }
-        catch(e){
+        catch (e) {
             console.error(e.response.data)
         }
         nextPageToken = paginatedSubResponse.data.nextPageToken;
@@ -144,7 +144,8 @@ async function updateSubscriptions(auth) {
     var unfilteredUploads = [].concat.apply([], uploadsForEachSub);
 
     var currentDaysUploads = await filterForCurrentDay(unfilteredUploads);
-    currentDaysUploads = await getVideoDurationsAndTags(auth, currentDaysUploads);
+    currentDaysUploads = await getVideoInfo(auth, currentDaysUploads);
+    currentDaysUploads = filterOutPrivateVideos(currentDaysUploads)
     currentDaysUploads = applyChannelFilters(currentDaysUploads);
 
     // Sort videos by time uploaded, least recent first
@@ -155,8 +156,7 @@ async function updateSubscriptions(auth) {
     await addVideosToPlaylists(auth, currentDaysUploads);
 
     // Save timestamp of most recent video to file so next time we know the starting point (if there were new vids)
-    if (currentDaysUploads.length > 0)
-    {
+    if (currentDaysUploads.length > 0) {
         await fs.promises.writeFile(TIMESTAMP_PATH, currentDaysUploads[currentDaysUploads.length - 1].contentDetails.videoPublishedAt);
         console.log('Last timestamp saved to ' + TIMESTAMP_PATH);
     }
@@ -169,7 +169,7 @@ async function filterForCurrentDay(unfilteredUploads) {
         lastTimestamp = await fs.promises.readFile(TIMESTAMP_PATH, 'utf-8');
     }
     catch {
-		console.error('No timestamp found, defaulting to 1 day before now.');
+        console.error('No timestamp found, defaulting to 1 day before now.');
         lastTimestamp = now.clone().subtract(1, 'days');
     }
 
@@ -200,62 +200,57 @@ async function addVideosToPlaylists(auth, videoList) {
         return playlist.snippet.title == 'Car';
     });
 
-    // Videos less than or equal to 30 mins are added to subscriptions
-    const subVideos = videoList.filter(video => {
-        return video.duration <= 30;
-    });
-
-    // Videos greater than 30 mins are added to cars
-    const carVideos = videoList.filter(video => {
-        return video.duration > 30;
-    });
-
-    // Sequentially insert videos into sub playlist
-    await subVideos.reduce(async (prevPromise, nextVid) => {
+    // Sequentially insert videos into appropriate playlist
+    await videoList.reduce(async (prevPromise, nextVid) => {
         await prevPromise;
-		console.log((await service.playlistItems.insert({
-            auth: auth,
-            part: 'snippet',
-            resource:
-            {
-                snippet: {
-                    resourceId: nextVid.snippet.resourceId,
-                    playlistId: subPlaylist.id,
+
+        if (nextVid.duration <= 30) {
+            (await service.playlistItems.insert({
+                auth: auth,
+                part: 'snippet',
+                resource:
+                {
+                    snippet: {
+                        resourceId: nextVid.snippet.resourceId,
+                        playlistId: subPlaylist.id,
+                    }
                 }
-            }
-        })).status);
+            }));
+        }
+        else {
+            await service.playlistItems.insert({
+                auth: auth,
+                part: 'snippet',
+                resource:
+                {
+                    snippet: {
+                        resourceId: nextVid.snippet.resourceId,
+                        playlistId: carPlaylist.id,
+                    }
+                }
+            });
+        }
         return;
-    }, Promise.resolve());
-
-    // Sequentially insert videos into car playlist
-    await carVideos.reduce( async (prevPromise, nextVid) => {
-        await prevPromise;
-        return service.playlistItems.insert({
-            auth: auth,
-            part: 'snippet',
-            resource:
-            {
-                snippet: {
-                    resourceId: nextVid.snippet.resourceId,
-                    playlistId: carPlaylist.id,
-                }
-            }
-        });
     }, Promise.resolve());
 }
 
-async function getVideoDurationsAndTags(auth, videoList) {
+async function getVideoInfo(auth, videoList) {
     // For each playlist item, get its video object so we can get the duration (formatted to minutes) and tags
     videoList = await Promise.all(videoList.map(async video => {
         const videoResponse = await service.videos.list({
             auth: auth,
-            part: 'contentDetails, snippet',
+            part: 'contentDetails, snippet, status, liveStreamingDetails',
             id: video.snippet.resourceId.videoId,
             maxResults: 1,
         });
 
         video.duration = moment.duration(videoResponse.data.items[0].contentDetails.duration).asMinutes();
         video.tags = videoResponse.data.items[0].snippet.tags;
+        video.privacyStatus = videoResponse.data.items[0].status.privacyStatus;
+        video.liveBroadcastContent = videoResponse.data.items[0].snippet.liveBroadcastContent;
+        if (videoResponse.data.items[0].liveStreamingDetails) {
+            video.liveStreamingDetails = videoResponse.data.items[0].liveStreamingDetails;
+        }
         return video;
     }));
 
@@ -271,12 +266,12 @@ function applyChannelFilters(videoList) {
             // Only hip-hop and rap reviews from theneedledrop
             case ('theneedledrop'):
                 return video.snippet.title.toLowerCase().includes('review') &&
-                    (video.tags.includes('rap') || video.tags.includes('hip hop'));
+                    (video.tags?.includes('rap') || video.tags?.includes('hip hop'));
 
             // Only hip-hop and rap reviews from fantano
             case ('fantano'):
                 return (video.snippet.title.toLowerCase().includes('memes') ||
-                    video.tags.includes('rap') || video.tags.includes('hip hop')) && !/20\d\d/.test(video.snippet.title);
+                    video.tags?.includes('rap') || video.tags?.includes('hip hop')) && !/20\d\d/.test(video.snippet.title);
 
             // Only Mic'd up from NFL's Channel
             case ('NFL'):
@@ -287,20 +282,29 @@ function applyChannelFilters(videoList) {
             case ('Arlo'):
                 return !video.snippet.title.toLowerCase().includes('news roundup') &&
                     !video.snippet.title.toLowerCase().includes('predict') &&
-                    !video.snippet.title.toLowerCase().includes('wishlist') && 
+                    !video.snippet.title.toLowerCase().includes('wishlist') &&
                     !video.snippet.title.toLowerCase().includes('splatoon');
 
             // Remove WAN show and PC builds/upgrades from LinusTechTips
             case ('Linus Tech Tips'):
-                return !(video.snippet.title.toLowerCase().includes('wan show') ||
-                video.snippet.title.toLowerCase().includes('tech upgrade') ||
-                video.tags.includes('Tech Upgrade') || 
-                video.tags.includes('tech upgrade') ||
-                video.tags.includes('Tech Makeover') || 
-                video.tags.includes('tech makeover'));
-            
+                return !(video.snippet.title.toLowerCase().includes('tech upgrade') ||
+                    video.tags?.includes('Tech Upgrade') ||
+                    video.tags?.includes('tech upgrade') ||
+                    video.tags?.includes('Tech Makeover') ||
+                    video.tags?.includes('tech makeover'));
+
             case ('ShortCircuit'):
-                return !(video.snippet.title.toLowerCase().includes('monitor'));
+                return !(video.tags?.includes('keyboard') ||
+                    video.tags?.includes('laptop') ||
+                    (video.tags?.includes('3D') && video.tags?.includes('printer')) ||
+                    video.tags?.includes('monitor') ||
+                    video.tags?.includes('cooling') ||
+                    video.tags?.includes('fan') ||
+                    video.tags?.includes('fans') ||
+                    video.tags?.includes('water cooling') ||
+                    video.tags?.includes('case') ||
+                    video.tags?.includes('trade show') ||
+                    video.tags?.includes('desk'));
 
             // Only Hot Ones from First We Feast
             case ('First We Feast'):
@@ -308,9 +312,22 @@ function applyChannelFilters(videoList) {
 
             // Only Smash and Nintendo Reactions from Max Dood, plus street fighter 6
             case ('Maximilian Dood'):
-                return video.snippet.title.toLowerCase().includes('max reacts') ||
-                    video.snippet.title.toLowerCase().includes('nintendo') ||
-                    video.tags.includes('street fighter 6');
+                return !(video.tags?.includes('fatal fury') ||
+                    video.tags?.includes('tekken') ||
+                    video.tags?.includes('tekken 8') ||
+                    video.tags?.includes('guilty gear') ||
+                    video.tags?.includes('killer instinct') ||
+                    video.tags?.includes('virtua fighter') ||
+                    video.tags?.includes('mortal kombat') ||
+                    video.tags?.includes('mortal kombat 1') ||
+                    video.tags?.includes('armored core') ||
+                    video.tags?.includes('final fantasy') ||
+                    video.tags?.includes('kof') ||
+                    video.tags?.includes('spider-man') ||
+                    video.tags?.includes('fatal fury') ||
+                    video.tags?.includes('bloodborne') ||
+                    video.snippet.title?.toLowerCase().includes('matches') ||
+                    video.tags?.includes('sonic'));
 
             // Only SM64 vids from Simply
             case ('Simply'):
@@ -334,30 +351,54 @@ function applyChannelFilters(videoList) {
                 return video.snippet.title.toLowerCase().startsWith('arteezy') ||
                     video.snippet.title.toLowerCase().startsWith('mason');
 
-            // Only David Pakman videos 10 minutes or less, no caller videos
+            // Only David Pakman videos 10 minutes or less, no caller videos or MyPillow guy
             case ('David Pakman Show'):
-                return video.duration < 11 && !(video.snippet.toLowerCase.includes('caller'));
-			
-			// No Sonic videos from Werster
-			case ('Werster'):
-				return !video.snippet.title.toLowerCase().includes('sonic');
-            
+                return video.duration < 11 &&
+                    !(video.snippet.title.toLowerCase().includes('caller') || 
+                        video.snippet.title.toLowerCase().includes('mypillow') || 
+                        video.snippet.title.toLowerCase().includes('mike lindell') ||
+                        (video.snippet.title.toLowerCase().includes('trump') && video.snippet.title.toLowerCase().includes('lawyer')) ||
+                        video.snippet.title.includes('?') ||
+                        video.snippet.title.toLowerCase().includes('vivek ramaswamy') ||
+                        video.snippet.title.toLowerCase().includes('audience') ||
+                        video.tags?.includes('hate mail') ||
+                        video.tags?.includes('voicemail'));
+
+            // No Sonic videos from Werster
+            case ('Werster'):
+                return !video.snippet.title.toLowerCase().includes('sonic');
+
             case ('Brett Kollman'):
                 return !(video.snippet.title.toLowerCase().includes('nfl draft'));
 
             case ('Kurzgesagt – In a Nutshell'):
                 return !(video.snippet.title.toLowerCase().includes('virus') ||
-                        video.snippet.title.toLowerCase().includes('body') ||
-                        video.snippet.title.toLowerCase().includes('space'));
-            
+                    video.snippet.title.toLowerCase().includes('body') ||
+                    video.snippet.title.toLowerCase().includes('space'));
+
             case ('Dorkly'):
                 return !(video.snippet.title.toLowerCase().includes('compilation'));
 
             case ('GeoWizard'):
-                return video.tags.includes('geoguessr') && !video.snippet.title.toLowerCase().includes('play along');
+                return video.tags?.includes('geoguessr') && !video.snippet.title.toLowerCase().includes('play along');
 
             case ('ProJared'):
                 return !video.snippet.title.toLowerCase().includes('now in the 90s');
+
+            case ('Ludwig'):
+                return 'liveStreamingDetails' in video === false;
+
+            case ('Destiny'):
+                return 'liveStreamingDetails' in video === false;
+
+            case ('Atrioc'):
+                return true;
+
+            case ('Lythero'):
+                return !(video.snippet.title.toLowerCase().includes('half-life') ||
+                    video.snippet.title.toLowerCase().includes('half life') ||
+                    video.snippet.title.toLowerCase().includes('shadow the hedgehog') ||
+                    video.snippet.title.toLowerCase().includes('l4d2'));
             // All else are good
             default:
                 return true;
@@ -365,4 +406,10 @@ function applyChannelFilters(videoList) {
     });
 
     return videoList;
+}
+
+function filterOutPrivateVideos(videoList) {
+    return videoList.filter(video => {
+        return (video.liveBroadcastContent == "none" || video.liveBroadcastContent == undefined) && video.privacyStatus === 'public';
+    })
 }
